@@ -1,0 +1,141 @@
+name: AppImage
+
+# Manual only: the Qt download dominates runtime, and the AppImage is a
+# release artifact rather than a per-commit check.
+on:
+  workflow_dispatch:
+    inputs:
+      qt_version:
+        description: Qt version to build against
+        required: false
+        default: "6.8.3"
+
+env:
+  # Qt 6.5+ defaults QtMultimedia to the FFmpeg backend, which is far more
+  # bundle-friendly than the GStreamer backend. The base image's own Qt is
+  # too old, so Qt comes from aqtinstall rather than apt.
+  QT_ARCH: linux_gcc_64
+  APPIMAGE_EXTRACT_AND_RUN: 1
+
+jobs:
+  appimage:
+    name: AppImage (x86_64)
+    runs-on: ubuntu-latest
+    # Pinned in a container rather than using a runner label so the ABI target
+    # is ours, not tied to GitHub's runner deprecation schedule. Because Qt is
+    # installed by aqtinstall, this choice sets exactly one thing: the glibc
+    # floor of the resulting AppImage. 24.04 = glibc 2.39.
+    container: ubuntu:24.04
+
+    steps:
+      # libpulse-dev/libasound2-dev are needed at link time, not just runtime:
+      # Qt's official libQt6Multimedia references pa_strerror@PULSE_0, so the
+      # GUI fails to link without PulseAudio present.
+      - name: Install build and packaging dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config git curl ca-certificates \
+            file desktop-file-utils patchelf zsync \
+            python3 python3-venv \
+            libgl1-mesa-dev libglx-dev libegl-dev \
+            libxkbcommon-dev libxkbcommon-x11-0 libxcb-cursor0 \
+            libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
+            libxcb-render-util0 libxcb-shape0 libxcb-xkb1 \
+            libfontconfig1 libfreetype6 libdbus-1-3 \
+            libpulse-dev libasound2-dev
+
+      - uses: actions/checkout@v4
+
+      - name: Install Qt ${{ inputs.qt_version }}
+        # A venv, not plain pip3: 24.04 enforces PEP 668 and refuses
+        # installs into the system interpreter.
+        run: |
+          python3 -m venv /opt/aqt
+          /opt/aqt/bin/pip install --no-cache-dir aqtinstall
+          /opt/aqt/bin/aqt install-qt linux desktop "${{ inputs.qt_version }}" "$QT_ARCH" \
+            -m qtmultimedia --outputdir /opt/qt
+          echo "QT_ROOT=/opt/qt/${{ inputs.qt_version }}/gcc_64" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$QT_ROOT"
+          cmake --build build --parallel
+
+      - name: Prepare icon
+        run: |
+          # linuxdeploy wants the icon basename to match Icon= in the .desktop
+          # file, which is "obsbot-control", not "camera".
+          cp resources/icons/camera.svg obsbot-control.svg
+
+      - name: Fetch linuxdeploy
+        run: |
+          base=https://github.com/linuxdeploy
+          curl -fsSLo /usr/local/bin/linuxdeploy \
+            $base/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          curl -fsSLo /usr/local/bin/linuxdeploy-plugin-qt \
+            $base/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage
+          chmod +x /usr/local/bin/linuxdeploy /usr/local/bin/linuxdeploy-plugin-qt
+
+      - name: Build AppImage
+        env:
+          ARCH: x86_64
+          EXTRA_QT_MODULES: multimedia
+        run: |
+          export QMAKE="$QT_ROOT/bin/qmake6"
+          export PATH="$QT_ROOT/bin:$PATH"
+          export LD_LIBRARY_PATH="$QT_ROOT/lib:$LD_LIBRARY_PATH"
+          # -l bundles the vendored SDK explicitly and lets linuxdeploy rewrite
+          # its rpath; libGL/Mesa/libdrm are dropped by linuxdeploy's
+          # excludelist so the host's drivers get used instead.
+          linuxdeploy \
+            --appdir AppDir \
+            -e bin/obsbot-gui \
+            -l sdk/lib/libdev.so.1.0.2 \
+            -d obsbot-control.desktop \
+            -i obsbot-control.svg \
+            --plugin qt \
+            --output appimage
+          mv ./*.AppImage obsbot-control-x86_64.AppImage
+
+      # A produced AppImage is not a working one. Confirm the SDK and a Qt
+      # multimedia backend actually landed inside it.
+      - name: Verify AppImage contents
+        run: |
+          ./obsbot-control-x86_64.AppImage --appimage-extract >/dev/null
+          status=0
+
+          for lib in libdev.so.1.0.2 libQt6Multimedia.so.6 libQt6OpenGLWidgets.so.6; do
+            if ! find squashfs-root -name "$lib" | grep -q .; then
+              echo "::error::$lib missing from AppImage"
+              status=1
+            fi
+          done
+
+          # QCamera is useless without a media backend plugin.
+          if ! find squashfs-root -path '*multimedia*' -name '*.so' | grep -q .; then
+            echo "::error::no QtMultimedia backend plugin bundled; camera preview would fail"
+            status=1
+          fi
+          find squashfs-root -path '*multimedia*' -name '*.so' -printf 'backend: %f\n'
+
+          # Host GL must NOT be bundled, or the GLSL filters break on other GPUs.
+          if find squashfs-root \( -name 'libGL.so*' -o -name 'libdrm.so*' \) | grep -q .; then
+            echo "::error::host GL/DRM libraries were bundled; must use the host's"
+            status=1
+          fi
+
+          echo "== glibc floor of the shipped binary =="
+          objdump -T squashfs-root/usr/bin/obsbot-gui \
+            | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -3
+          exit $status
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: obsbot-control-AppImage
+          path: obsbot-control-x86_64.AppImage
+          if-no-files-found: error

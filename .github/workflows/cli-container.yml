@@ -1,0 +1,59 @@
+name: CLI container
+
+# Manual dispatch and tags only. Pushing an image to a public registry on every
+# main commit is more publishing than this needs.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}/obsbot-cli
+
+jobs:
+  container:
+    name: Build and push obsbot-cli image
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=tag
+            type=sha,format=short
+            type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
+
+      # linux/amd64 only: the vendored SDK is x86-64, so an arm64 image
+      # could not link.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/cli.Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test the pushed image
+        run: |
+          image=$(echo "${{ steps.meta.outputs.tags }}" | head -1)
+          # No camera is attached to the runner, so this checks that the image
+          # runs and resolves the SDK -- not that it can talk to a device.
+          docker run --rm --entrypoint ldd "$image" /usr/bin/obsbot-cli
