@@ -1,0 +1,65 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (Ubuntu 24.04, x86_64)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The vendored SDK (sdk/lib/libdev.so) is x86-64 only, so this project
+      # cannot be built for other architectures.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            pkg-config \
+            qt6-base-dev \
+            qt6-multimedia-dev \
+            libgl1-mesa-dev
+
+      # Not build.sh: its install path prompts interactively even with
+      # --confirm. These are the same steps PKGBUILD uses.
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      # A successful link doesn't prove the SDK is reachable at runtime, since
+      # CMake sets BUILD_RPATH to sdk/lib. Fail loudly if anything is unresolved.
+      - name: Check runtime dependencies resolve
+        run: |
+          status=0
+          for bin in bin/obsbot-gui bin/obsbot-cli; do
+            echo "== $bin =="
+            ldd "$bin"
+            if ldd "$bin" | grep -q 'not found'; then
+              echo "::error file=$bin::unresolved shared library dependency"
+              status=1
+            fi
+          done
+          exit $status
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: obsbot-control-x86_64
+          path: |
+            bin/obsbot-gui
+            bin/obsbot-cli
+          if-no-files-found: error
