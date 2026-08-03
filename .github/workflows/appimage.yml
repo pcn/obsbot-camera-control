@@ -31,6 +31,11 @@ env:
   # pass an empty version to aqtinstall. Keep this default in step with the
   # workflow_dispatch input default above.
   QT_VERSION: ${{ inputs.qt_version || '6.8.3' }}
+  # The compatibility promise made to users, enforced by the verify step. Set
+  # to the container's own glibc rather than the lower value the bundle
+  # happens to require, so the promise cannot be broken by a dependency
+  # bumping the real floor. Changing this means changing README.md too.
+  GLIBC_FLOOR: "2.39"
 
 jobs:
   appimage:
@@ -168,9 +173,29 @@ jobs:
             status=1
           fi
 
-          echo "== glibc floor of the shipped binary =="
-          objdump -T squashfs-root/usr/bin/obsbot-gui \
-            | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -3
+          # The documented floor is the build container's glibc, not whatever
+          # today's dependency set happens to need. Those differ: the bundle
+          # currently tops out at 2.38, but promising 2.38 would stake the
+          # compatibility claim on an incidental measurement that any Qt or
+          # apt update could quietly raise. Promise 2.39 and enforce it.
+          #
+          # Every bundled ELF object counts, not just the executable. A Qt or
+          # FFmpeg library can raise the real floor without obsbot-gui itself
+          # changing, which the old single-binary objdump would have missed.
+          echo "== highest glibc symbol version required by any bundled object =="
+          worst=$(find squashfs-root -type f \( -name '*.so*' -o -path '*/bin/*' \) -print0 \
+            | while IFS= read -r -d '' f; do
+                file -b "$f" | grep -q ELF || continue
+                objdump -T "$f" 2>/dev/null \
+                  | grep -oE 'GLIBC_[0-9]+\.[0-9]+(\.[0-9]+)?'
+              done | sed 's/GLIBC_//' | sort -uV | tail -1)
+          echo "required: ${worst:-none}   documented floor: $GLIBC_FLOOR"
+          if [ -n "$worst" ] \
+             && [ "$(printf '%s\n%s\n' "$GLIBC_FLOOR" "$worst" | sort -V | tail -1)" != "$GLIBC_FLOOR" ]; then
+            echo "::error::bundle needs glibc $worst, above the documented floor of $GLIBC_FLOOR;" \
+                 "either lower the build container or update the documented floor in README.md"
+            status=1
+          fi
           exit $status
 
       - uses: actions/upload-artifact@v4
