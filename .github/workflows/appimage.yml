@@ -1,7 +1,10 @@
 name: AppImage
 
-# Manual only: the Qt download dominates runtime, and the AppImage is a
-# release artifact rather than a per-commit check.
+# Not per-commit: the Qt download dominates runtime. But packaging breaks in
+# ways a plain compile cannot catch (a new Qt module, a missing backend
+# plugin), so it also runs on pull requests that touch what goes into the
+# bundle. Branch runs upload the AppImage as an artifact, so a test build
+# never needs to reach main.
 on:
   workflow_dispatch:
     inputs:
@@ -9,6 +12,14 @@ on:
         description: Qt version to build against
         required: false
         default: "6.8.3"
+  pull_request:
+    paths:
+      - .github/workflows/appimage.yml
+      - CMakeLists.txt
+      - src/**
+      - sdk/**
+      - resources/**
+      - obsbot-control.desktop
 
 env:
   # Qt 6.5+ defaults QtMultimedia to the FFmpeg backend, which is far more
@@ -16,6 +27,10 @@ env:
   # too old, so Qt comes from aqtinstall rather than apt.
   QT_ARCH: linux_gcc_64
   APPIMAGE_EXTRACT_AND_RUN: 1
+  # Only workflow_dispatch supplies inputs; a pull_request run would otherwise
+  # pass an empty version to aqtinstall. Keep this default in step with the
+  # workflow_dispatch input default above.
+  QT_VERSION: ${{ inputs.qt_version || '6.8.3' }}
 
 jobs:
   appimage:
@@ -38,7 +53,7 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             build-essential cmake pkg-config git curl ca-certificates \
-            file desktop-file-utils patchelf zsync \
+            file desktop-file-utils patchelf zsync zstd tar \
             python3 python3-venv \
             libgl1-mesa-dev libglx-dev libegl-dev \
             libxkbcommon-dev libxkbcommon-x11-0 libxcb-cursor0 \
@@ -49,15 +64,28 @@ jobs:
 
       - uses: actions/checkout@v4
 
-      - name: Install Qt ${{ inputs.qt_version }}
+      # Keyed on the Qt version and arch only: the install is a pure function of
+      # those, independent of our source. This is what makes a per-PR AppImage
+      # build affordable, since the download otherwise dominates the run.
+      - name: Cache Qt
+        id: qt-cache
+        uses: actions/cache@v4
+        with:
+          path: /opt/qt
+          key: qt-${{ env.QT_VERSION }}-${{ env.QT_ARCH }}-multimedia
+
+      - name: Install Qt ${{ env.QT_VERSION }}
+        if: steps.qt-cache.outputs.cache-hit != 'true'
         # A venv, not plain pip3: 24.04 enforces PEP 668 and refuses
         # installs into the system interpreter.
         run: |
           python3 -m venv /opt/aqt
           /opt/aqt/bin/pip install --no-cache-dir aqtinstall
-          /opt/aqt/bin/aqt install-qt linux desktop "${{ inputs.qt_version }}" "$QT_ARCH" \
+          /opt/aqt/bin/aqt install-qt linux desktop "$QT_VERSION" "$QT_ARCH" \
             -m qtmultimedia --outputdir /opt/qt
-          echo "QT_ROOT=/opt/qt/${{ inputs.qt_version }}/gcc_64" >> "$GITHUB_ENV"
+
+      - name: Locate Qt
+        run: echo "QT_ROOT=/opt/qt/$QT_VERSION/gcc_64" >> "$GITHUB_ENV"
 
       - name: Build
         run: |
