@@ -184,13 +184,17 @@ jobs:
           # FFmpeg library can raise the real floor without obsbot-gui itself
           # changing, which the old single-binary objdump would have missed.
           echo "== highest glibc symbol version required by any bundled object =="
-          worst=$(find squashfs-root -type f \( -name '*.so*' -o -path '*/bin/*' \) -print0 \
-            | while IFS= read -r -d '' f; do
+          worst=$(find squashfs-root -type f \( -name '*.so*' -o -path '*/bin/*' \) \
+            -exec sh -c 'for f; do
                 file -b "$f" | grep -q ELF || continue
-                objdump -T "$f" 2>/dev/null \
-                  | grep -oE 'GLIBC_[0-9]+\.[0-9]+(\.[0-9]+)?'
-              done | sed 's/GLIBC_//' | sort -uV | tail -1)
+                objdump -T "$f" 2>/dev/null | grep -oE "GLIBC_[0-9]+\.[0-9]+(\.[0-9]+)?"
+              done' sh {} + \
+            | sed 's/GLIBC_//' | sort -uV | tail -1)
           echo "required: ${worst:-none}   documented floor: $GLIBC_FLOOR"
+          if [ -z "$worst" ]; then
+            echo "::error::found no glibc symbol versions at all; the scan is broken"
+            status=1
+          fi
           if [ -n "$worst" ] \
              && [ "$(printf '%s\n%s\n' "$GLIBC_FLOOR" "$worst" | sort -V | tail -1)" != "$GLIBC_FLOOR" ]; then
             echo "::error::bundle needs glibc $worst, above the documented floor of $GLIBC_FLOOR;" \
@@ -288,20 +292,28 @@ jobs:
 
           # A bad argument must be rejected without touching hardware, and must
           # exit 2 -- Stream Deck buttons and scripts branch on these codes.
-          ./obsbot-cli-x86_64.AppImage hdr maybe >/dev/null 2>&1
-          rc=$?
+          # `|| rc=$?` is required, not stylistic: steps run under `bash -e`, so
+          # a bare call to a command expected to fail aborts the step before the
+          # exit code can be captured.
+          rc=0
+          ./obsbot-cli-x86_64.AppImage hdr maybe >/dev/null 2>&1 || rc=$?
           if [ "$rc" -ne 2 ]; then
             echo "::error::expected exit 2 for a bad argument, got $rc"
             status=1
           fi
 
           # Same glibc promise as the GUI bundle, enforced over every ELF here.
-          worst=$(find squashfs-root -type f \( -name '*.so*' -o -path '*/bin/*' \) -print0 \
-            | while IFS= read -r -d '' f; do
+          worst=$(find squashfs-root -type f \( -name '*.so*' -o -path '*/bin/*' \) \
+            -exec sh -c 'for f; do
                 file -b "$f" | grep -q ELF || continue
-                objdump -T "$f" 2>/dev/null | grep -oE 'GLIBC_[0-9]+\.[0-9]+(\.[0-9]+)?'
-              done | sed 's/GLIBC_//' | sort -uV | tail -1)
+                objdump -T "$f" 2>/dev/null | grep -oE "GLIBC_[0-9]+\.[0-9]+(\.[0-9]+)?"
+              done' sh {} + \
+            | sed 's/GLIBC_//' | sort -uV | tail -1)
           echo "required: ${worst:-none}   documented floor: $GLIBC_FLOOR"
+          if [ -z "$worst" ]; then
+            echo "::error::found no glibc symbol versions at all; the scan is broken"
+            status=1
+          fi
           if [ -n "$worst" ] \
              && [ "$(printf '%s\n%s\n' "$GLIBC_FLOOR" "$worst" | sort -V | tail -1)" != "$GLIBC_FLOOR" ]; then
             echo "::error::bundle needs glibc $worst, above the documented floor of $GLIBC_FLOOR"
