@@ -13,14 +13,21 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_DEBUG ${CMAKE_SOURCE_DIR}/bin)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_SOURCE_DIR}/bin)
 
-# Find Qt6
-find_package(Qt6 REQUIRED COMPONENTS Widgets Multimedia MultimediaWidgets OpenGLWidgets)
+# The CLI links only the vendored SDK, so it can be built on a machine (or in
+# a container image) with no Qt at all. Turning the GUI off is what makes the
+# CLI-only AppImage small and quick to build.
+option(BUILD_GUI "Build the Qt GUI application" ON)
+
+if(BUILD_GUI)
+    find_package(Qt6 REQUIRED COMPONENTS Widgets Multimedia MultimediaWidgets OpenGLWidgets)
+endif()
 
 # SDK paths
 set(SDK_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/sdk/include)
 set(SDK_LIB_DIR ${CMAKE_SOURCE_DIR}/sdk/lib)
 
 # GUI Application
+if(BUILD_GUI)
 add_executable(obsbot-gui
     src/gui/main.cpp
     src/gui/MainWindow.cpp
@@ -72,10 +79,13 @@ target_link_libraries(obsbot-gui PRIVATE
 target_compile_definitions(obsbot-gui PRIVATE
     $<$<CONFIG:Debug>:OBSBOT_DEBUG_GEOMETRY>
 )
+endif()
 
 # CLI Application
 add_executable(obsbot-cli
     src/cli/meet2_test.cpp
+    src/cli/Commands.cpp
+    src/cli/Commands.h
     src/common/Config.cpp
     src/common/Config.h
 )
@@ -95,12 +105,19 @@ target_link_libraries(obsbot-cli PRIVATE
 
 # Set RPATH for finding libdev.so
 # Build uses local SDK, install uses system library path
-set_target_properties(obsbot-gui PROPERTIES
-    BUILD_RPATH "${SDK_LIB_DIR}"
-    INSTALL_RPATH "/usr/lib"
-)
+if(BUILD_GUI)
+    set_target_properties(obsbot-gui PROPERTIES
+        BUILD_RPATH "${SDK_LIB_DIR}"
+        INSTALL_RPATH "/usr/lib"
+    )
+endif()
 
+# The CLI has no Qt types, so the project-wide AUTOMOC/AUTOUIC/AUTORCC would
+# only warn about a missing Qt in a -DBUILD_GUI=OFF build.
 set_target_properties(obsbot-cli PROPERTIES
     BUILD_RPATH "${SDK_LIB_DIR}"
     INSTALL_RPATH "/usr/lib"
+    AUTOMOC OFF
+    AUTOUIC OFF
+    AUTORCC OFF
 )

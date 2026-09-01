@@ -9,14 +9,14 @@ FROM ubuntu:24.04 AS build
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake pkg-config \
-        qt6-base-dev qt6-multimedia-dev libgl1-mesa-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
 COPY . .
 
-# The GUI target is part of the same CMake project, so build only what we ship.
-RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+# -DBUILD_GUI=OFF drops the project's find_package(Qt6), so this image needs no
+# Qt packages at all -- the CLI links only the vendored SDK.
+RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_GUI=OFF \
     && cmake --build build --parallel --target obsbot-cli
 
 
