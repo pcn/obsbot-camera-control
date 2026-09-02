@@ -50,6 +50,6 @@ dmesg | grep -i obsbot           # Kernel messages
 
 ## SDK
 
-The OBSBOT SDK (`sdk/`) is a closed-source library distributed as precompiled binaries (.so/.dylib/.dll) plus C++ headers. No implementation source is provided — just a ~4000-line header of declarations and one sample app. Linux support is labeled "(beta)" by OBSBOT. Current version: v1.0.2 (OBSBOT's "v2.1.0" download contains identical binaries and headers).
+The OBSBOT SDK (`sdk/`) is a closed-source library distributed as precompiled binaries (.so/.dylib/.dll) plus C++ headers. No implementation source is provided — just a ~4000-line header of declarations and one sample app. Linux support is labeled "(beta)" by OBSBOT. Current version: v2.1.0_8, vendored at `sdk/v2.1.0_8` (soname `libdev.so.1.0.0`), with v1.0.2 retained for rollback. Do not trust the version label alone: an earlier OBSBOT download labeled "v2.1.0" was byte-identical to v1.0.2, so verify a new SDK by SHA256 and by grepping the binary for the product you need. v2.1.0_8 is genuinely different and adds Tiny 3 support (`ObsbotProdTiny3 = 18`).
 
 What we can do: read the headers to understand the API surface, check `ObsbotProductType` for device support, use callbacks and methods as declared. What we can't do: fix SDK bugs, add device support, or understand why something doesn't work internally. We work around SDK limitations, not through them.

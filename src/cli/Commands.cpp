@@ -1,6 +1,7 @@
 #include "Commands.h"
 
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <iostream>
 #include <sstream>
@@ -12,6 +13,7 @@
 #include <dev/devs.hpp>
 
 #include "Config.h"
+#include "V4l2Backend.h"
 
 using namespace std;
 
@@ -77,6 +79,55 @@ bool parseInt(const string &s, int &value)
 }
 
 double clampRange(double v, double lo, double hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+// ----------------------------------------------------------- v4l2 backend
+
+/// The camera's V4L2 node, or nullptr if no OBSBOT node is present.
+///
+/// Preferred over the SDK for controls that standard UVC already covers. Two
+/// reasons. It is the same path the SDK itself takes -- libdev.so's
+/// UVCControllerControls table decodes as the standard Camera Terminal and
+/// Processing Unit control set, not as vendor commands -- so nothing is lost.
+/// And it is immediate, where resolving an SDK device costs a 10s detection
+/// timeout that a camera the SDK cannot claim (the Tiny 3, see ADR-002) always
+/// pays in full before failing. A Stream Deck button cannot wait 10s to zoom.
+V4l2Backend *v4l2()
+{
+    static V4l2Backend backend;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        const std::string path = V4l2Backend::findObsbotDevice();
+        if (!path.empty()) backend.open(path);
+    }
+    return backend.isOpen() ? &backend : nullptr;
+}
+
+/// Report a V4L2 write. Mirrors sdkResult()'s contract: ExitOk only when the
+/// camera actually changed.
+int v4l2Result(const string &what, bool ok)
+{
+    if (ok) {
+        out() << what << "\n";
+        return ExitOk;
+    }
+    cerr << "obsbot-cli: " << what << " failed (V4L2 ioctl refused)" << endl;
+    return ExitDeviceError;
+}
+
+/// Snap @p raw into @p range, honouring the control's step. The kernel rejects
+/// or silently rounds an off-step value, so do it here where the result can be
+/// reported accurately.
+int snapToRange(double raw, const V4l2Backend::ControlRange &range)
+{
+    if (raw < range.min) raw = range.min;
+    if (raw > range.max) raw = range.max;
+    const int step = range.step > 0 ? range.step : 1;
+    const long long offset = static_cast<long long>(llround((raw - range.min) / step)) * step;
+    int value = static_cast<int>(range.min + offset);
+    if (value > range.max) value -= step;
+    return value;
+}
 
 // ------------------------------------------------------------- device status
 
@@ -248,6 +299,109 @@ int cmdAi(const DeviceProvider &device, Config &, const vector<string> &args)
                      dev->cameraSetAiModeU(active ? Device::AiWorkModeNone : mode));
 }
 
+/// Which gesture the camera should stop reacting to.
+///
+/// The maintainer's problem is the camera enabling AI tracking on its own when
+/// they move their hands while working. Target selection is the gesture that
+/// most plausibly does that, so it is the default: disabling the master switch
+/// would also kill gesture zoom, which is worth keeping.
+///
+/// Which of these the Tiny 3 actually honours is not settled -- the SDK's
+/// @category for this family says "tail2 and later products", but that
+/// annotation has already proven wrong in the permissive direction twice on
+/// this camera (gimbalGetAttitudeInfoR and aiGetGimbalParaR both work here
+/// despite not listing tiny3), so the only way to know is to ask the device.
+/// aiSetGestureCtrlR(bool) is deliberately not used: the SDK marks it
+/// deprecated and "no longer used".
+struct GestureTarget {
+    const char *name;
+    Device::DevGestureParaType type;
+    int individual;  /// gesture index for the older aiSetGestureCtrlIndividualR
+};
+
+const GestureTarget kGestureTargets[] = {
+    {"target", Device::DevGestureParaTypeTargetSelection, 0},
+    {"zoom",   Device::DevGestureParaTypeZoom,            1},
+    {"all",    Device::DevGestureParaTypeGesture,        -1},
+};
+
+/// `gesture on|off|toggle [target|zoom|all]`.
+///
+/// Deliberately does NOT use booleanCommand(): that reads state through
+/// readStatus(), which never succeeds on a Tiny 3 because it gates on a
+/// zoom_ratio encoding this model does not use. Reading gesture state through
+/// aiGetGestureParaR sidesteps that entirely, so `gesture toggle` works on a
+/// camera where `hdr toggle` currently cannot.
+int cmdGesture(const DeviceProvider &device, Config &, const vector<string> &args)
+{
+    if (args.empty() || args.size() > 2) {
+        return usageError("gesture: expected 'on|off|toggle [target|zoom|all]'");
+    }
+
+    const Switch sw = parseSwitch(args[0]);
+    if (sw == Switch::Invalid) {
+        return usageError("gesture: expected on|off|toggle, got '" + args[0] + "'");
+    }
+
+    const GestureTarget *target = &kGestureTargets[0];
+    if (args.size() == 2) {
+        target = nullptr;
+        for (const auto &g : kGestureTargets) {
+            if (args[1] == g.name) target = &g;
+        }
+        if (!target) {
+            return usageError("gesture: expected target|zoom|all, got '" + args[1] + "'");
+        }
+    }
+
+    auto dev = device();
+    if (!dev) return ExitNoDevice;
+
+    // Read first, both to support toggle and to report what we found: a
+    // command that silently no-ops because the setting was already correct is
+    // indistinguishable from one the camera ignored.
+    bool current = false;
+    const int32_t getRet = dev->aiGetGestureParaR(target->type, current);
+    if (getRet != 0 && sw == Switch::Toggle) {
+        cerr << "obsbot-cli: gesture: cannot toggle -- the camera did not report"
+             << " its gesture state (SDK code " << getRet << ")" << endl;
+        return ExitDeviceError;
+    }
+
+    const bool want = (sw == Switch::Toggle) ? !current : (sw == Switch::On);
+
+    int32_t ret = dev->aiSetGestureParaR(target->type, want);
+    const char *via = "aiSetGestureParaR";
+    if (ret != 0 && target->individual >= 0) {
+        // Fall back to the older per-gesture call. Which family this model
+        // honours is exactly what needs recording, so name the one that won.
+        ret = dev->aiSetGestureCtrlIndividualR(target->individual, want);
+        via = "aiSetGestureCtrlIndividualR";
+    }
+
+    const string label = string("gesture ") + target->name + " " + (want ? "on" : "off");
+    if (ret != 0) {
+        cerr << "obsbot-cli: " << label << " failed (SDK code " << ret << ")" << endl;
+        return ExitDeviceError;
+    }
+
+    // Read back rather than trusting the write: this camera has already been
+    // observed accepting and echoing a pan/tilt command it never executed.
+    bool after = want;
+    const bool verified = dev->aiGetGestureParaR(target->type, after) == 0;
+    out() << label;
+    if (getRet == 0) out() << " (was " << (current ? "on" : "off") << ")";
+    if (verified && after != want) {
+        out() << " -- WARNING: camera still reports "
+              << (after ? "on" : "off") << "\n";
+        cerr << "obsbot-cli: gesture: the camera accepted the change but reports"
+             << " the old value; it may not support this control" << endl;
+        return ExitDeviceError;
+    }
+    out() << " [via " << via << "]\n";
+    return ExitOk;
+}
+
 int cmdFov(const DeviceProvider &device, Config &, const vector<string> &args)
 {
     // Ordered so `cycle` walks wide -> medium -> narrow -> wide.
@@ -285,56 +439,304 @@ int cmdFov(const DeviceProvider &device, Config &, const vector<string> &args)
     return sdkResult(string("fov ") + names[index], dev->cameraSetFovU(order[index]));
 }
 
+/// Zoom argument. `1.0`-`2.0` is the historical ratio form; a `%` suffix
+/// addresses the device's own scale directly.
+///
+/// The two forms exist because `zoom_absolute` is a device-specific scale
+/// (0-100 on the Tiny 3), not a magnification factor, and the SDK's 1.0x-2.0x
+/// contract has no published mapping onto it. Rather than invent a
+/// magnification figure the hardware never promised, the ratio form is defined
+/// to span the device's full zoom range: 1.0 is fully wide, 2.0 fully tight.
+/// On a camera whose V4L2 range is itself expressed as a ratio (min 100,
+/// max 200) that mapping is the identity, so the historical meaning survives
+/// where it was ever well defined.
+struct ZoomArg {
+    bool percent = false;
+    double value = 0.0;
+};
+
+bool parseZoomArg(const string &s, ZoomArg &arg)
+{
+    if (!s.empty() && s.back() == '%') {
+        arg.percent = true;
+        return parseDouble(s.substr(0, s.size() - 1), arg.value);
+    }
+    arg.percent = false;
+    return parseDouble(s, arg.value);
+}
+
 int cmdZoom(const DeviceProvider &device, Config &, const vector<string> &args)
 {
     const double kMin = 1.0, kMax = 2.0;
 
-    if (args.empty()) return usageError("zoom: expected <1.0-2.0>|in|out|reset");
+    if (args.empty()) return usageError("zoom: expected <1.0-2.0>|<0-100>%|in|out|reset");
 
     const bool relative = args[0] == "in" || args[0] == "out";
-    double target = 0.0;
-    double step = 0.1;
+    ZoomArg target;
+    ZoomArg step;
+    step.value = 0.1;
 
     if (args[0] == "reset") {
         if (args.size() != 1) return usageError("zoom: 'reset' takes no arguments");
-        target = kMin;
+        target.value = kMin;
     } else if (relative) {
         if (args.size() > 2) return usageError("zoom: expected 'in|out [step]'");
-        if (args.size() == 2 && !parseDouble(args[1], step)) {
+        if (args.size() == 2 && !parseZoomArg(args[1], step)) {
             return usageError("zoom: step must be a number, got '" + args[1] + "'");
         }
     } else {
         if (args.size() != 1) return usageError("zoom: expected a single value");
-        if (!parseDouble(args[0], target)) {
-            return usageError("zoom: expected a number in 1.0-2.0, got '" + args[0] + "'");
+        if (!parseZoomArg(args[0], target)) {
+            return usageError("zoom: expected a number in 1.0-2.0 or 0-100%, got '" +
+                              args[0] + "'");
         }
-        if (target < kMin || target > kMax) {
+        if (target.percent) {
+            if (target.value < 0.0 || target.value > 100.0) {
+                return usageError("zoom: " + args[0] + " is outside the supported range 0-100%");
+            }
+        } else if (target.value < kMin || target.value > kMax) {
             return usageError("zoom: " + args[0] + " is outside the supported range 1.0-2.0");
         }
+    }
+
+    // V4L2 first: see v4l2() for why. Only a camera with no OBSBOT V4L2 node
+    // falls through to the SDK.
+    if (V4l2Backend *v = v4l2()) {
+        const V4l2Backend::ControlRange range = v->getZoomRange();
+        if (!range.valid) {
+            cerr << "obsbot-cli: zoom: " << v->devicePath()
+                 << " does not expose zoom_absolute" << endl;
+            return ExitDeviceError;
+        }
+        const double span = range.max - range.min;
+
+        // A ratio spans the range; a percentage addresses it directly.
+        const auto toRaw = [&](const ZoomArg &a) {
+            return a.percent ? range.min + (a.value / 100.0) * span
+                             : range.min + ((a.value - kMin) / (kMax - kMin)) * span;
+        };
+
+        double raw;
+        if (relative) {
+            // Read the device rather than a stored value: zoom_absolute
+            // reports the real current setting.
+            const int current = v->getZoomAbsolute();
+            if (current < 0) {
+                cerr << "obsbot-cli: zoom: could not read the current zoom level" << endl;
+                return ExitDeviceError;
+            }
+            const double delta = (step.percent ? step.value / 100.0
+                                               : step.value / (kMax - kMin)) * span;
+            raw = current + (args[0] == "in" ? delta : -delta);
+        } else {
+            raw = toRaw(target);
+        }
+
+        const int value = snapToRange(raw, range);
+        const double pct = span > 0 ? (value - range.min) * 100.0 / span : 0.0;
+        char label[64];
+        snprintf(label, sizeof(label), "zoom %d (%.0f%% of range)", value, pct);
+        return v4l2Result(label, v->setZoomAbsolute(value));
     }
 
     auto dev = device();
     if (!dev) return ExitNoDevice;
 
+    double ratio = target.percent ? kMin + (target.value / 100.0) * (kMax - kMin)
+                                  : target.value;
     if (relative) {
         // Zoom, unlike pan/tilt, is reported by the camera, so relative moves
         // need no stored state.
         Device::CameraStatus st;
         if (!readStatus(dev, st)) return ExitDeviceError;
         const double current = st.tiny.zoom_ratio / 100.0;
-        target = clampRange(args[0] == "in" ? current + step : current - step, kMin, kMax);
+        const double delta = step.percent ? (step.value / 100.0) * (kMax - kMin) : step.value;
+        ratio = clampRange(args[0] == "in" ? current + delta : current - delta, kMin, kMax);
     }
 
     char label[32];
-    snprintf(label, sizeof(label), "zoom %.2fx", target);
-    return sdkResult(label, dev->cameraSetZoomAbsoluteR(static_cast<float>(target)));
+    snprintf(label, sizeof(label), "zoom %.2fx", ratio);
+    return sdkResult(label, dev->cameraSetZoomAbsoluteR(static_cast<float>(ratio)));
 }
 
-/// Pan/tilt is the one setting the camera does not report back, so relative
-/// moves have nothing to be relative to within a single process. The stored
-/// position in the config file is the only continuity across the one-shot
-/// invocations a Stream Deck makes, so relative moves read it and write it
-/// back. Absolute moves persist too, to keep the stored value honest.
+/// Pan/tilt on the V4L2 path, in the device's own arc-second units.
+///
+/// Whether `pan_absolute`/`tilt_absolute` report true gimbal position or merely
+/// echo the last write is UNRESOLVED -- see finding PROJ-010-F001. Reading the
+/// device is still the better source for a relative move than the stored
+/// config value: under the echo hypothesis it is exactly equivalent, and if
+/// readback is live it is strictly better. The config shadow is kept updated
+/// regardless, so nothing that depended on it regresses.
+struct PanTiltRanges {
+    V4l2Backend::ControlRange pan;
+    V4l2Backend::ControlRange tilt;
+    bool valid() const { return pan.valid && tilt.valid; }
+};
+
+PanTiltRanges panTiltRanges(V4l2Backend *v)
+{
+    return {v->getPanRange(), v->getTiltRange()};
+}
+
+/// Arc-seconds per degree, the unit V4L2 uses for pan/tilt. The Tiny 3's step
+/// is 3600, i.e. exactly one degree of *commanded* angle.
+///
+/// Commanded degrees are not motor degrees. Measured on a Tiny 3 against
+/// gimbalGetAttitudeInfoR: commanding -40 reached 37.17 deg of motor pitch,
+/// -70 reached 67.71, -74 reached 73.76. The camera undershoots by a couple of
+/// degrees in the mid range and the error is not a constant scale factor, so
+/// no correction is applied here -- applying one from four samples on a single
+/// axis in a single direction would invent precision we do not have. Treat a
+/// commanded angle as accurate to within a few degrees. See PROJ-010-F004.
+const double kArcSecPerDegree = 3600.0;
+
+/// Safe commanded-angle limits, in degrees, tighter than anything the device
+/// advertises.
+///
+/// Both nominal sources over-report tilt travel: V4L2 VIDIOC_QUERYCTRL reports
+/// +/-324000 (+/-90 deg) and the SDK's aiGetGimbalParaR reports pitch
+/// +/-90 deg, but the real mechanical stop is at about 76.2 deg of motor
+/// pitch. Commanding past it does not simply saturate harmlessly: once the
+/// gimbal is driven into the stop it stops responding to further commands
+/// altogether -- a sweep that ended by commanding 0 deg left the motor sitting
+/// at +76.21 -- and only gimbalRstPosR() recovers it. So the limit here is not
+/// a cosmetic clamp, it is what keeps a user from wedging their camera.
+///
+/// -70 deg was measured reaching 67.71 deg of motor pitch, leaving roughly
+/// 8 deg of headroom before the stop. Pan is left at its queried range: both
+/// extremes (+/-130 deg) were confirmed to move without wedging.
+///
+/// This bound is symmetric but the evidence behind it is not: only the
+/// DOWNWARD stop was measured against motor angle. Commanding +83 deg up did
+/// move the camera, so upward travel is very likely greater than 70 deg and
+/// this limit needlessly restricts it. Symmetric is the safe direction to err
+/// while the upward stop is unmeasured -- an over-tight limit costs a user
+/// some range, an over-loose one wedges their gimbal. Measure the upward stop
+/// with gimbalGetAttitudeInfoR and split this into two constants.
+const double kTiltSafeDegrees = 70.0;
+
+int applyPanTiltRaw(V4l2Backend *v, const string &label, int panRaw, int tiltRaw)
+{
+    if (!v->setPanAbsolute(panRaw)) return v4l2Result(label, false);
+    return v4l2Result(label, v->setTiltAbsolute(tiltRaw));
+}
+
+/// `orient <pan-deg> <tilt-deg>` points the camera at an absolute position in
+/// degrees, which is what a start-of-day "look here" needs. Degrees rather than
+/// the device's arc-seconds because a caller should not have to multiply by
+/// 3600, and rather than pan-tilt's normalized -1.0..1.0 because a physical
+/// angle is what makes an orientation reproducible across models with
+/// different travel.
+/// Reject a commanded angle we cannot honour, rather than clamping it.
+///
+/// Clamping is the wrong default for an orientation command: a caller asking
+/// to point at an angle the hardware cannot reach wants to be told, not
+/// quietly aimed somewhere else. Readback cannot be used to detect the
+/// substitution afterwards either, since it echoes the last accepted command
+/// regardless of where the gimbal actually went.
+bool checkAxis(const char *axis, double deg, double limit, const string &cmd)
+{
+    if (deg >= -limit && deg <= limit) return true;
+    cerr << "obsbot-cli: " << cmd << ": " << axis << " " << deg
+         << " deg is outside the usable range +/-" << limit << " deg" << endl;
+    return false;
+}
+
+int cmdOrient(const DeviceProvider &, Config &config, const vector<string> &args)
+{
+    if (args.size() != 2) {
+        return usageError("orient: expected '<pan-degrees> <tilt-degrees>'");
+    }
+    double panDeg = 0.0, tiltDeg = 0.0;
+    if (!parseDouble(args[0], panDeg) || !parseDouble(args[1], tiltDeg)) {
+        return usageError("orient: pan and tilt must be numbers in degrees");
+    }
+
+    // The tilt bound is a fixed measured constant, so check it before the
+    // device is touched: an unreachable angle should fail instantly rather
+    // than after a device scan, the same way a bad argument does.
+    if (!checkAxis("tilt", tiltDeg, kTiltSafeDegrees, "orient")) return ExitUsage;
+
+    V4l2Backend *v = v4l2();
+    if (!v) {
+        cerr << "obsbot-cli: orient: no OBSBOT V4L2 device found;"
+             << " orient is V4L2-only" << endl;
+        return ExitNoDevice;
+    }
+    const PanTiltRanges r = panTiltRanges(v);
+    if (!r.valid()) {
+        cerr << "obsbot-cli: orient: " << v->devicePath()
+             << " does not expose pan_absolute and tilt_absolute" << endl;
+        return ExitDeviceError;
+    }
+
+    // Pan's bound comes from the driver's queried range, which both extremes
+    // were confirmed to reach without wedging, so it needs the device.
+    const double panLimitDeg = r.pan.max / kArcSecPerDegree;
+    if (!checkAxis("pan", panDeg, panLimitDeg, "orient")) return ExitUsage;
+
+    const int panRaw  = snapToRange(panDeg * kArcSecPerDegree, r.pan);
+    const int tiltRaw = snapToRange(tiltDeg * kArcSecPerDegree, r.tilt);
+
+    char label[96];
+    snprintf(label, sizeof(label), "orient %.0f %.0f (pan %d, tilt %d)",
+             panRaw / kArcSecPerDegree, tiltRaw / kArcSecPerDegree, panRaw, tiltRaw);
+    const int rc = applyPanTiltRaw(v, label, panRaw, tiltRaw);
+
+    if (rc == ExitOk) {
+        // Keep the shadow honest for pan-tilt's relative moves.
+        Config::CameraSettings settings = config.getSettings();
+        settings.pan  = r.pan.max  ? static_cast<double>(panRaw)  / r.pan.max  : 0.0;
+        settings.tilt = r.tilt.max ? static_cast<double>(tiltRaw) / r.tilt.max : 0.0;
+        config.setSettings(settings);
+        if (config.isSavingEnabled()) config.save();
+    }
+    return rc;
+}
+
+/// Re-home the gimbal through the SDK.
+///
+/// This is a recovery command, not a convenience. Driving the tilt axis into
+/// its mechanical stop leaves the gimbal ignoring every subsequent V4L2
+/// position write, and nothing on the V4L2 path gets it back -- so without
+/// this a user who overshoots has no way to recover from the CLI. Measured on
+/// a Tiny 3: gimbalRstPosR() restored a gimbal wedged at +76.21 deg of motor
+/// pitch to level, and separately recovered one sitting at -90.50.
+///
+/// Deliberately NOT implemented with cameraSetPanTiltAbsolute(0,0): that call
+/// produced a clean level home on several attempts but on another drove pitch
+/// to -90.50, making a wedged gimbal worse. gimbalRstPosR has not failed.
+///
+/// This pays the SDK's device-detection cost, unlike the V4L2-backed commands.
+/// That is the right trade for a command a user reaches for when the camera is
+/// already pointing at the floor.
+int cmdRecenter(const DeviceProvider &device, Config &config, const vector<string> &args)
+{
+    if (!args.empty()) return usageError("recenter: takes no arguments");
+
+    auto dev = device();
+    if (!dev) return ExitNoDevice;
+
+    const int rc = sdkResult("recenter", dev->gimbalRstPosR());
+    if (rc == ExitOk) {
+        // The gimbal is now at its own home, so the shadow's old position is
+        // stale in a way that would send the next relative move somewhere odd.
+        Config::CameraSettings settings = config.getSettings();
+        settings.pan = 0.0;
+        settings.tilt = 0.0;
+        config.setSettings(settings);
+        if (config.isSavingEnabled()) config.save();
+    }
+    return rc;
+}
+
+/// Pan/tilt readback echoes the last accepted command rather than reporting
+/// position (see Commands.h), so relative moves still need the stored position
+/// in the config file for continuity across the one-shot invocations a Stream
+/// Deck makes. Absolute moves persist too, to keep the stored value honest.
+/// The device is read in preference to the shadow where possible, which under
+/// the echo behaviour is equivalent but also picks up writes made by other
+/// tools.
 int cmdPanTilt(const DeviceProvider &device, Config &config, const vector<string> &args)
 {
     if (args.empty()) {
@@ -366,12 +768,38 @@ int cmdPanTilt(const DeviceProvider &device, Config &config, const vector<string
         }
     }
 
-    auto dev = device();
-    if (!dev) return ExitNoDevice;
+    // V4L2 first, for the same latency reason as zoom: see v4l2().
+    V4l2Backend *v = v4l2();
+    shared_ptr<Device> dev;
+    if (!v) {
+        dev = device();
+        if (!dev) return ExitNoDevice;
+    }
 
     Config::CameraSettings settings = config.getSettings();
     double pan = settings.pan;
     double tilt = settings.tilt;
+
+    PanTiltRanges ranges{};
+    if (v) {
+        ranges = panTiltRanges(v);
+        if (!ranges.valid()) {
+            cerr << "obsbot-cli: pan-tilt: " << v->devicePath()
+                 << " does not expose pan_absolute and tilt_absolute" << endl;
+            return ExitDeviceError;
+        }
+        // Prefer the device's own value over the stored shadow for relative
+        // moves; see the note above PanTiltRanges on why this is safe even
+        // though readback faithfulness is unresolved.
+        const int curPan = v->getPanAbsolute();
+        const int curTilt = v->getTiltAbsolute();
+        if (curPan >= ranges.pan.min && ranges.pan.max != 0) {
+            pan = static_cast<double>(curPan) / ranges.pan.max;
+        }
+        if (curTilt >= ranges.tilt.min && ranges.tilt.max != 0) {
+            tilt = static_cast<double>(curTilt) / ranges.tilt.max;
+        }
+    }
 
     if (centering) {
         pan = 0.0;
@@ -389,8 +817,21 @@ int cmdPanTilt(const DeviceProvider &device, Config &config, const vector<string
     char label[48];
     snprintf(label, sizeof(label), "pan-tilt %.2f %.2f", pan, tilt);
 
-    int32_t ret = dev->cameraSetPanTiltAbsolute(pan, tilt);
-    if (ret != 0) return sdkResult(label, ret);
+    if (v) {
+        // Same mechanical-stop guard as orient: pan-tilt's -1.0..1.0 maps
+        // onto the queried range, whose tilt extreme would wedge the gimbal.
+        const double tiltLimit = kTiltSafeDegrees * kArcSecPerDegree;
+        const int panRaw = snapToRange(pan * ranges.pan.max, ranges.pan);
+        double tiltReq = tilt * ranges.tilt.max;
+        if (tiltReq >  tiltLimit) tiltReq =  tiltLimit;
+        if (tiltReq < -tiltLimit) tiltReq = -tiltLimit;
+        const int tiltRaw = snapToRange(tiltReq, ranges.tilt);
+        const int rc = applyPanTiltRaw(v, label, panRaw, tiltRaw);
+        if (rc != ExitOk) return rc;
+    } else {
+        int32_t ret = dev->cameraSetPanTiltAbsolute(pan, tilt);
+        if (ret != 0) return sdkResult(label, ret);
+    }
 
     settings.pan = pan;
     settings.tilt = tilt;
@@ -401,7 +842,7 @@ int cmdPanTilt(const DeviceProvider &device, Config &config, const vector<string
         cerr << "obsbot-cli: warning: could not save position to " << config.getConfigPath()
              << "; the next relative move will start from the stored value" << endl;
     }
-    return sdkResult(label, 0);
+    return v ? v4l2Result(label, true) : sdkResult(label, 0);
 }
 
 int cmdFocus(const DeviceProvider &device, Config &, const vector<string> &args)
@@ -546,9 +987,12 @@ const Command kCommands[] = {
     {"hdr",        "on|off|toggle",                 "HDR (wide dynamic range)",             cmdHdr},
     {"tracking",   "on|off",                        "auto-framing (media mode)",            cmdTracking},
     {"ai",         "<mode>|toggle <mode>",          "none group single hand whiteboard desk", cmdAi},
+    {"gesture",    "on|off|toggle [target|zoom|all]","hand-gesture triggers (default target)",cmdGesture},
     {"fov",        "wide|medium|narrow|cycle",      "field of view (86/78/65 degrees)",     cmdFov},
-    {"zoom",       "<1.0-2.0>|in|out|reset [step]", "zoom level",                           cmdZoom},
+    {"zoom",       "<1.0-2.0>|<n>%|in|out|reset",   "zoom; 1.0-2.0 spans the full range",   cmdZoom},
     {"pan-tilt",   "<pan> <tilt>|center|<dir>",     "gimbal; dir = left right up down",     cmdPanTilt},
+    {"orient",     "<pan-deg> <tilt-deg>",          "absolute gimbal angle in degrees",     cmdOrient},
+    {"recenter",   "",                              "re-home the gimbal (SDK; recovery)",   cmdRecenter},
     {"focus",      "auto|<0-100>|in|out [step]",    "focus",                                cmdFocus},
     {"face-ae",    "on|off|toggle",                 "face auto-exposure",                   cmdFaceAe},
     {"face-focus", "on|off|toggle",                 "face auto-focus",                      cmdFaceFocus},
@@ -598,13 +1042,16 @@ void printUsage()
     for (const auto &c : kCommands) {
         const string invocation = string(c.name) + " " + c.args;
         cout << "  " << invocation;
-        for (size_t i = invocation.size(); i < 34; i++) cout << ' ';
-        cout << c.summary << "\n";
+        // Pad to the column, but never run the two together when an
+        // invocation is longer than the column is wide.
+        size_t pad = invocation.size() < 34 ? 34 - invocation.size() : 2;
+        cout << string(pad, ' ') << c.summary << "\n";
     }
     cout << "\nExamples:\n"
          << "  obsbot-cli hdr toggle\n"
          << "  obsbot-cli ai toggle single\n"
          << "  obsbot-cli zoom in 0.25\n"
+         << "  obsbot-cli zoom 40%\n"
          << "  obsbot-cli preset 2\n";
 }
 

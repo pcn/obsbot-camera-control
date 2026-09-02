@@ -40,8 +40,16 @@ void writeOutput(int fd);
 bool isCommand(const std::string &name);
 
 /// Execute one command. @p config is the already-loaded configuration;
-/// commands needing state the camera cannot report back (pan/tilt) read and
-/// write it through @p config.
+/// commands needing pan/tilt state read and write it through @p config.
+///
+/// The config shadow exists because the camera's pan/tilt readback is not a
+/// position report. V4L2 pan_absolute/tilt_absolute return exactly the last
+/// accepted command -- verified exact and stable at t=0 through 2s across
+/// repeated writes, and faithful about step-snapping and range-clamping -- but
+/// they say nothing about where the gimbal actually is. On a Tiny 3 readback
+/// reported pan 0 / tilt 0 while the motor was physically wedged at 76 deg of
+/// pitch. That is worse than silence, because it looks authoritative. True
+/// position is available only from the SDK's gimbalGetAttitudeInfoR().
 int run(const DeviceProvider &device, Config &config,
         const std::string &name, const std::vector<std::string> &args);
 

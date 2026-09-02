@@ -19,6 +19,13 @@ COPY . .
 RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_GUI=OFF \
     && cmake --build build --parallel --target obsbot-cli
 
+# Stage the SDK at a fixed path so the runtime stage need not name a version.
+# sdk/lib is a symlink into the chosen sdk/<version>/lib, and COPY --from
+# resolves a symlinked source directory inconsistently, so flatten it here
+# with cp -a, which keeps the relative libdev.so and libdev.so.1 symlinks the
+# loader needs rather than dereferencing them into duplicate 26MB copies.
+RUN mkdir -p /sdklib && cp -a "$(readlink -f sdk/lib)/." /sdklib/
+
 
 FROM ubuntu:24.04
 
@@ -30,10 +37,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /src/bin/obsbot-cli /usr/bin/obsbot-cli
-COPY --from=build /src/sdk/lib/libdev.so.1.0.2 /usr/lib/libdev.so.1.0.2
-RUN ln -s libdev.so.1.0.2 /usr/lib/libdev.so.1 \
-    && ln -s libdev.so.1.0.2 /usr/lib/libdev.so \
-    && ldconfig \
+# Copy the staged SDK rather than a pinned filename: the vendored SDK version
+# changes (v1.0.2 shipped libdev.so.1.0.2, v2.1.0_8 ships libdev.so.1.0.0) and
+# COPY cannot expand a shell substitution, so a pinned name would break the
+# image build on every SDK upgrade.
+COPY --from=build /sdklib/ /usr/lib/
+RUN ldconfig \
     # CMake sets INSTALL_RPATH=/usr/lib, but the binary is copied from the
     # build tree where BUILD_RPATH points at /src/sdk/lib. Fail the image build
     # now rather than shipping something that cannot resolve the SDK.

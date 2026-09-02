@@ -137,10 +137,15 @@ jobs:
           # -l bundles the vendored SDK explicitly and lets linuxdeploy rewrite
           # its rpath; libGL/Mesa/libdrm are dropped by linuxdeploy's
           # excludelist so the host's drivers get used instead.
+          # Resolve the SDK soname from the symlink instead of pinning it:
+          # the vendored SDK version changes (v1.0.2 shipped libdev.so.1.0.2,
+          # v2.1.0_8 ships libdev.so.1.0.0) and a pinned name fails the build
+          # silently at the bundling step on every upgrade.
+          SDK_LIB=$(readlink -f sdk/lib/libdev.so)
           linuxdeploy \
             --appdir AppDir \
             -e bin/obsbot-gui \
-            -l sdk/lib/libdev.so.1.0.2 \
+            -l "$SDK_LIB" \
             -d obsbot-control.desktop \
             -i obsbot-control.svg \
             --plugin qt \
@@ -154,7 +159,8 @@ jobs:
           ./obsbot-control-x86_64.AppImage --appimage-extract >/dev/null
           status=0
 
-          for lib in libdev.so.1.0.2 libQt6Multimedia.so.6 libQt6OpenGLWidgets.so.6; do
+          SDK_LIB=$(basename "$(readlink -f sdk/lib/libdev.so)")
+          for lib in "$SDK_LIB" libQt6Multimedia.so.6 libQt6OpenGLWidgets.so.6; do
             if ! find squashfs-root -name "$lib" | grep -q .; then
               echo "::error::$lib missing from AppImage"
               status=1
@@ -211,8 +217,9 @@ jobs:
 
   # Separate from the GUI bundle on purpose. The CLI links only the vendored
   # SDK, so with -DBUILD_GUI=OFF it needs no Qt at all: no aqtinstall download,
-  # no Qt plugin, and an AppImage of a few MB rather than ~150. A Stream Deck
-  # or hotkey runs this per button press, so start-up cost is the whole point.
+  # no Qt plugin, and a 1.6 MB AppImage rather than the GUI bundle's 46 MB. A
+  # Stream Deck or hotkey runs this per button press, so start-up cost is the
+  # whole point.
   cli-appimage:
     name: CLI AppImage (x86_64)
     runs-on: ubuntu-latest
@@ -255,10 +262,11 @@ jobs:
           ARCH: x86_64
         run: |
           # No --plugin qt: this binary links libdev and libstdc++ only.
+          SDK_LIB=$(readlink -f sdk/lib/libdev.so)
           linuxdeploy \
             --appdir AppDir \
             -e bin/obsbot-cli \
-            -l sdk/lib/libdev.so.1.0.2 \
+            -l "$SDK_LIB" \
             -d obsbot-cli.desktop \
             -i obsbot-cli.svg \
             --output appimage
@@ -271,8 +279,9 @@ jobs:
 
           # The SDK is the only thing that must be bundled; without it the
           # binary cannot resolve at run time on a machine that lacks it.
-          if ! find squashfs-root -name 'libdev.so.1.0.2' | grep -q .; then
-            echo "::error::libdev.so.1.0.2 missing from AppImage"
+          SDK_LIB=$(basename "$(readlink -f sdk/lib/libdev.so)")
+          if ! find squashfs-root -name "$SDK_LIB" | grep -q .; then
+            echo "::error::$SDK_LIB missing from AppImage"
             status=1
           fi
 

@@ -315,9 +315,20 @@ path and the command as arguments:
 /opt/obsbot-cli-x86_64.AppImage hdr toggle
 ```
 
-The CLI AppImage is built separately from the desktop one and is ~2 MB with no
-Qt inside, so a button press starts it without the GUI bundle's overhead. Grab
-`obsbot-cli-x86_64.AppImage` from the AppImage workflow's artifacts.
+The CLI AppImage is built separately from the desktop one and is 1.6 MB with no
+Qt inside (the desktop bundle is 46 MB), so a button press starts it without the
+GUI bundle's overhead.
+
+To get it, download the `obsbot-cli-AppImage` artifact from an AppImage workflow
+run:
+
+```bash
+gh run download <run-id> -n obsbot-cli-AppImage -D /opt
+chmod +x /opt/obsbot-cli-x86_64.AppImage    # GitHub zips artifacts, losing +x
+```
+
+Artifacts are kept for 90 days, so re-run the workflow (or pull a newer run) if
+the download 404s.
 
 ## Project Structure
 

@@ -50,8 +50,8 @@ add_executable(obsbot-gui
     src/gui/VirtualCameraStreamer.h
     src/gui/PreviewWindow.cpp
     src/gui/PreviewWindow.h
-    src/gui/V4l2Backend.cpp
-    src/gui/V4l2Backend.h
+    src/common/V4l2Backend.cpp
+    src/common/V4l2Backend.h
     src/gui/XYPad.cpp
     src/gui/XYPad.h
     src/common/Config.cpp
@@ -88,6 +88,8 @@ add_executable(obsbot-cli
     src/cli/Commands.h
     src/common/Config.cpp
     src/common/Config.h
+    src/common/V4l2Backend.cpp
+    src/common/V4l2Backend.h
 )
 
 target_include_directories(obsbot-cli PRIVATE
