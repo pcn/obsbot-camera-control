@@ -42,14 +42,19 @@ void CameraController::connectToCamera(const QString &devicePath)
         -> std::shared_ptr<Device>
     {
         if (list.empty()) return nullptr;
-        if (m_selectedDevicePath.isEmpty()) return list.front();
+        if (m_selectedDevicePath.isEmpty() || list.size() == 1) return list.front();
 
-        for (const auto &dev : list) {
-            if (QString::fromStdString(dev->videoDevPath()) == m_selectedDevicePath)
-                return dev;
-        }
-        qDebug() << "CameraController: device" << m_selectedDevicePath
-                 << "not found in SDK list, using first available";
+        // SDK v2.1.0_8 dropped Device::videoDevPath() on Linux -- its
+        // #elif __linux__ block is missing from dev.hpp, though the symbol is
+        // still in the .so -- and it was the only accessor tying an SDK device
+        // to a /dev/video* node. Nothing else can bridge them: the Tiny 3
+        // exposes no per-unit USB serial (no ID_SERIAL_SHORT), and the serial
+        // the SDK reports arrives over the vendor protocol, so it is absent
+        // from sysfs. With one camera this does not matter; with several,
+        // honouring a specific selection is no longer possible.
+        qDebug() << "CameraController: cannot match" << m_selectedDevicePath
+                 << "to an SDK device (no path accessor on Linux);"
+                 << list.size() << "devices present, using the first";
         return list.front();
     };
 
@@ -226,21 +231,33 @@ QString CameraController::getVideoDevicePath() const
 {
     if (m_v4l2Only)
         return m_v4l2DevicePath;
-    if (m_connected && m_device)
-        return QString::fromStdString(m_device->videoDevPath());
+    if (!m_v4l2DevicePath.isEmpty())
+        return m_v4l2DevicePath;
+    // Discover the node directly rather than asking the SDK: V4l2Backend
+    // matches on the card name and confirms the node carries camera controls,
+    // which is strictly more reliable than a path the SDK merely reports.
+    if (m_connected)
+        return QString::fromStdString(V4l2Backend::findObsbotDevice());
     return QString();
 }
 
 QMap<QString, QString> CameraController::getSerialsByDevicePath() const
 {
+    // Without Device::videoDevPath() there is no general way to say which
+    // node belongs to which SDK device (see pickDevice). The single-camera
+    // case is still answerable, and it is the common one: one SDK device and
+    // one detected node can only be each other. With more than one camera the
+    // map comes back empty and the caller simply shows no serial, which is
+    // better than labelling a camera with another camera's serial.
     QMap<QString, QString> result;
     const auto dev_list = Devices::get().getDevList();
-    for (const auto &dev : dev_list) {
-        const QString path = QString::fromStdString(dev->videoDevPath());
-        const QString serial = QString::fromStdString(dev->devSn());
-        if (!path.isEmpty() && !serial.isEmpty())
-            result.insert(path, serial);
-    }
+    if (dev_list.size() != 1)
+        return result;
+
+    const QString path = QString::fromStdString(V4l2Backend::findObsbotDevice());
+    const QString serial = QString::fromStdString(dev_list.front()->devSn());
+    if (!path.isEmpty() && !serial.isEmpty())
+        result.insert(path, serial);
     return result;
 }
 
