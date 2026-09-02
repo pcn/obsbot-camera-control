@@ -359,9 +359,25 @@ void applyConfigToCamera(shared_ptr<Device> dev, const Config::CameraSettings &s
     // Config stores the SDK's DevWhiteBalanceType values, which are not
     // contiguous -- Fine is 9, Cloudy 10, Shade 11, manual Kelvin 255 -- so
     // this has to be a lookup, not an index into a dense array.
-    cout << "  Setting White Balance: " << whiteBalanceName(settings.whiteBalance) << endl;
+    //
+    // The second argument is the manual colour temperature and is documented
+    // "only valid when wb_type is manual". Passing a hardcoded 0 here used to
+    // drop white_balance_kelvin entirely: the camera clamped 0 up to its 2000K
+    // minimum, which tells it the light is very warm, so it compensated with a
+    // heavy blue cast. The config value was parsed and range-checked and then
+    // never sent.
     Device::DevWhiteBalanceType wbType = static_cast<Device::DevWhiteBalanceType>(settings.whiteBalance);
-    ret = dev->cameraSetWhiteBalanceR(wbType, 0);
+    const bool manual = wbType == Device::DevWhiteBalanceManual;
+    int32_t wbParam = 0;
+    if (manual) {
+        // -1 is Config's "unset". Falling back to the driver default beats
+        // sending 0, which is not a temperature at all.
+        wbParam = settings.whiteBalanceKelvin > 0 ? settings.whiteBalanceKelvin : 5000;
+    }
+    cout << "  Setting White Balance: " << whiteBalanceName(settings.whiteBalance);
+    if (manual) cout << " (" << wbParam << "K)";
+    cout << endl;
+    ret = dev->cameraSetWhiteBalanceR(wbType, wbParam);
     if (ret != 0) {
         cout << "    Failed (code: " << ret << ")" << endl;
     }

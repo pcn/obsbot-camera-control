@@ -845,6 +845,104 @@ int cmdPanTilt(const DeviceProvider &device, Config &config, const vector<string
     return v ? v4l2Result(label, true) : sdkResult(label, 0);
 }
 
+/// `whitebal auto|<kelvin>` -- and with no argument, report the current
+/// setting.
+///
+/// The Kelvin figure is the colour temperature of the light in the room.
+/// Telling the camera the light is warm (a low number) makes it compensate by adding blue.
+/// A stale 2000K on this camera produced an unusably blue image for exactly
+/// that reason.
+///
+/// Uses V4L2 rather than the SDK for the same latency reason as zoom, and it is
+/// the only path that offers auto: the SDK's DevWhiteBalanceAuto is a
+/// mode value, whereas V4L2 exposes auto as its own control that the camera
+/// then drives continuously.
+int cmdWhiteBalance(const DeviceProvider &, Config &config, const vector<string> &args)
+{
+    if (args.size() > 1) {
+        return usageError("whitebal: expected 'auto'|<kelvin>, or no argument to report");
+    }
+
+    // Parse before touching the device, as elsewhere: a typo should not cost a
+    // device probe.
+    bool wantAuto = false;
+    int kelvin = 0;
+    const bool reporting = args.empty();
+    if (!reporting) {
+        if (args[0] == "auto") {
+            wantAuto = true;
+        } else if (!parseInt(args[0], kelvin)) {
+            return usageError("whitebal: expected 'auto' or a temperature in Kelvin, got '" +
+                              args[0] + "'");
+        }
+    }
+
+    V4l2Backend *v = v4l2();
+    if (!v) {
+        cerr << "obsbot-cli: whitebal: no OBSBOT V4L2 device found" << endl;
+        return ExitNoDevice;
+    }
+
+    if (reporting) {
+        const bool isAuto = v->getWhiteBalanceAuto();
+        out() << "whitebal " << (isAuto ? "auto" : "manual");
+        // The temperature control reads as inactive under auto, so its value
+        // is only meaningful when auto is off.
+        if (!isAuto) out() << " " << v->getWhiteBalanceTemperature() << "K";
+        out() << "\n";
+        return ExitOk;
+    }
+
+    // Persist whichever mode is chosen. Saving only the manual path would
+    // leave `apply` pushing a stale mode: the config file is what a bare
+    // `obsbot-cli` replays, so an unsaved `whitebal auto` would be silently
+    // undone the next time the config is applied.
+    const auto persist = [&config](int mode, int kelvin) {
+        Config::CameraSettings settings = config.getSettings();
+        settings.whiteBalance = mode;
+        if (kelvin > 0) settings.whiteBalanceKelvin = kelvin;
+        config.setSettings(settings);
+        if (config.isSavingEnabled() && !config.save()) {
+            cerr << "obsbot-cli: warning: could not save white balance to "
+                 << config.getConfigPath() << endl;
+        }
+    };
+
+    if (wantAuto) {
+        const int rc = v4l2Result("whitebal auto", v->setWhiteBalanceAuto(true));
+        // 0 is the SDK's DevWhiteBalanceAuto, which is what Config stores.
+        if (rc == ExitOk) persist(0, 0);
+        return rc;
+    }
+
+    const V4l2Backend::ControlRange range = v->getWhiteBalanceTemperatureRange();
+    if (!range.valid) {
+        cerr << "obsbot-cli: whitebal: " << v->devicePath()
+             << " does not expose white_balance_temperature" << endl;
+        return ExitDeviceError;
+    }
+    if (kelvin < range.min || kelvin > range.max) {
+        cerr << "obsbot-cli: whitebal: " << kelvin << "K is outside the supported range "
+             << range.min << "-" << range.max << "K" << endl;
+        return ExitUsage;
+    }
+
+    // Manual temperature is ignored while auto is engaged, so auto has to come
+    // off first or the write would silently do nothing.
+    if (!v->setWhiteBalanceAuto(false)) {
+        return v4l2Result("whitebal: disabling auto", false);
+    }
+    const int snapped = snapToRange(kelvin, range);
+    char label[64];
+    snprintf(label, sizeof(label), "whitebal %dK", snapped);
+    const int rc = v4l2Result(label, v->setWhiteBalanceTemperature(snapped));
+
+    // Config models manual mode as the SDK's DevWhiteBalanceManual (255)
+    // plus a Kelvin value.
+    if (rc == ExitOk) persist(255, snapped);
+    return rc;
+}
+
 int cmdFocus(const DeviceProvider &device, Config &, const vector<string> &args)
 {
     if (args.empty()) return usageError("focus: expected auto|<0-100>|in|out");
@@ -976,28 +1074,58 @@ int cmdStatus(const DeviceProvider &device, Config &, const vector<string> &args
 
 // ------------------------------------------------------------- command table
 
+/// Which section of --help a command appears under. Grouping beats alphabetical
+/// here because the commands split cleanly by what they act on: where the
+/// camera points and how it gathers light, versus how it processes the image,
+/// versus the two that are neither.
+enum Group {
+    GroupView,   /// aiming and optics -- moves the gimbal or changes the lens
+    GroupImage,  /// AI and colour processing applied to the captured image
+    GroupOther,  /// stored slots and state reporting
+};
+
 struct Command {
     const char *name;
     const char *args;
     const char *summary;
     int (*handler)(const DeviceProvider &, Config &, const vector<string> &);
+    Group group;
+};
+
+struct GroupInfo {
+    Group group;
+    const char *title;
+};
+
+const GroupInfo kGroups[] = {
+    {GroupView,  "Framing and optics"},
+    {GroupImage, "Image tuning (AI and colour)"},
+    {GroupOther, "Presets and state"},
 };
 
 const Command kCommands[] = {
-    {"hdr",        "on|off|toggle",                 "HDR (wide dynamic range)",             cmdHdr},
-    {"tracking",   "on|off",                        "auto-framing (media mode)",            cmdTracking},
-    {"ai",         "<mode>|toggle <mode>",          "none group single hand whiteboard desk", cmdAi},
-    {"gesture",    "on|off|toggle [target|zoom|all]","hand-gesture triggers (default target)",cmdGesture},
-    {"fov",        "wide|medium|narrow|cycle",      "field of view (86/78/65 degrees)",     cmdFov},
-    {"zoom",       "<1.0-2.0>|<n>%|in|out|reset",   "zoom; 1.0-2.0 spans the full range",   cmdZoom},
-    {"pan-tilt",   "<pan> <tilt>|center|<dir>",     "gimbal; dir = left right up down",     cmdPanTilt},
-    {"orient",     "<pan-deg> <tilt-deg>",          "absolute gimbal angle in degrees",     cmdOrient},
-    {"recenter",   "",                              "re-home the gimbal (SDK; recovery)",   cmdRecenter},
-    {"focus",      "auto|<0-100>|in|out [step]",    "focus",                                cmdFocus},
-    {"face-ae",    "on|off|toggle",                 "face auto-exposure",                   cmdFaceAe},
-    {"face-focus", "on|off|toggle",                 "face auto-focus",                      cmdFaceFocus},
-    {"preset",     "[save] 1|2|3",                  "recall or store a pan/tilt/zoom slot", cmdPreset},
-    {"status",     "",                              "print current state as key=value",     cmdStatus},
+    // Framing and optics: these change where the camera looks or how the lens
+    // gathers light. `ai` and `tracking` live here rather than under image
+    // tuning because both physically re-aim the gimbal.
+    {"ai",         "<mode>|toggle <mode>",          "none group single hand whiteboard desk", cmdAi,        GroupView},
+    {"focus",      "auto|<0-100>|in|out [step]",    "focus",                                cmdFocus,       GroupView},
+    {"fov",        "wide|medium|narrow|cycle",      "field of view (86/78/65 degrees)",     cmdFov,         GroupView},
+    {"orient",     "<pan-deg> <tilt-deg>",          "absolute gimbal angle in degrees",     cmdOrient,      GroupView},
+    {"pan-tilt",   "<pan> <tilt>|center|<dir>",     "gimbal; dir = left right up down",     cmdPanTilt,     GroupView},
+    {"recenter",   "",                              "re-home the gimbal (SDK; recovery)",   cmdRecenter,    GroupView},
+    {"tracking",   "on|off",                        "auto-framing (media mode)",            cmdTracking,    GroupView},
+    {"zoom",       "<1.0-2.0>|<n>%|in|out|reset",   "zoom; 1.0-2.0 spans the full range",   cmdZoom,        GroupView},
+
+    // Image tuning: applied to the captured image rather than to the optics.
+    {"face-ae",    "on|off|toggle",                 "face auto-exposure",                   cmdFaceAe,      GroupImage},
+    {"face-focus", "on|off|toggle",                 "face auto-focus",                      cmdFaceFocus,   GroupImage},
+    {"gesture",    "on|off|toggle [target|zoom|all]","hand-gesture triggers (default target)",cmdGesture,    GroupImage},
+    {"hdr",        "on|off|toggle",                 "HDR (wide dynamic range)",             cmdHdr,         GroupImage},
+    {"whitebal",   "auto|<kelvin>",                 "room light colour temp (2000-10000K)", cmdWhiteBalance,GroupImage},
+
+    // Neither of the above.
+    {"preset",     "[save] 1|2|3",                  "recall or store a pan/tilt/zoom slot", cmdPreset,      GroupOther},
+    {"status",     "",                              "print current state as key=value",     cmdStatus,      GroupOther},
 };
 
 }  // namespace
@@ -1039,13 +1167,17 @@ int run(const DeviceProvider &device, Config &config,
 void printUsage()
 {
     cout << "Commands (one-shot; exit 0 = applied, 1 = device error, 2 = usage, 3 = no camera):\n";
-    for (const auto &c : kCommands) {
-        const string invocation = string(c.name) + " " + c.args;
-        cout << "  " << invocation;
-        // Pad to the column, but never run the two together when an
-        // invocation is longer than the column is wide.
-        size_t pad = invocation.size() < 34 ? 34 - invocation.size() : 2;
-        cout << string(pad, ' ') << c.summary << "\n";
+    for (const auto &g : kGroups) {
+        cout << "\n" << g.title << ":\n";
+        for (const auto &c : kCommands) {
+            if (c.group != g.group) continue;
+            const string invocation = string(c.name) + " " + c.args;
+            cout << "  " << invocation;
+            // Pad to the column, but never run the two together when an
+            // invocation is longer than the column is wide.
+            size_t pad = invocation.size() < 34 ? 34 - invocation.size() : 2;
+            cout << string(pad, ' ') << c.summary << "\n";
+        }
     }
     cout << "\nExamples:\n"
          << "  obsbot-cli hdr toggle\n"
