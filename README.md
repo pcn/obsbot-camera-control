@@ -275,13 +275,60 @@ When window is shown/restored:
 
 ## Command Line Interface
 
-A CLI tool is also included for automation/scripting:
+`obsbot-cli` controls the camera from scripts, hotkeys, and stream controllers.
+Each invocation is one shot: it applies a single change and exits.
 
 ```bash
-./obsbot-cli
+obsbot-cli hdr toggle           # flip HDR
+obsbot-cli ai toggle single     # single-person tracking on, or off if already on
+obsbot-cli fov cycle            # wide -> medium -> narrow -> wide
+obsbot-cli zoom in 0.25         # relative, read back from the camera
+obsbot-cli pan-tilt center
+obsbot-cli preset 2             # recall a slot saved here or in the GUI
+obsbot-cli status               # key=value on stdout
+obsbot-cli --help               # full command list
 ```
 
-See CLI help for available commands.
+Run with no arguments (or `obsbot-cli apply`) to push the whole config file at
+`~/.config/obsbot-control/settings.conf`, and with `-i` for the interactive
+menu.
+
+### Scripting contract
+
+- **Exit codes**: `0` applied, `1` the camera refused it, `2` bad arguments
+  (nothing was sent), `3` no camera found.
+- **stdout carries only command output.** The SDK logs chatter to stdout, so
+  one-shot mode redirects that to stderr; `obsbot-cli status` is safe to parse.
+- Arguments are validated **before** the camera is scanned, so a typo fails in
+  milliseconds rather than after the 10-second detection timeout.
+- `toggle` reads current state from the camera. `tracking` has no `toggle`
+  because the device does not report media mode back — use `ai toggle <mode>`.
+- Pan/tilt is the one setting the camera cannot report, so relative moves track
+  position through the config file and write it back.
+
+### Stream Deck
+
+Use the System → Open action (or any "run command" plugin) with the AppImage
+path and the command as arguments:
+
+```
+/opt/obsbot-cli-x86_64.AppImage hdr toggle
+```
+
+The CLI AppImage is built separately from the desktop one and is 1.6 MB with no
+Qt inside (the desktop bundle is 46 MB), so a button press starts it without the
+GUI bundle's overhead.
+
+To get it, download the `obsbot-cli-AppImage` artifact from an AppImage workflow
+run:
+
+```bash
+gh run download <run-id> -n obsbot-cli-AppImage -D /opt
+chmod +x /opt/obsbot-cli-x86_64.AppImage    # GitHub zips artifacts, losing +x
+```
+
+Artifacts are kept for 90 days, so re-run the workflow (or pull a newer run) if
+the download 404s.
 
 ## Project Structure
 

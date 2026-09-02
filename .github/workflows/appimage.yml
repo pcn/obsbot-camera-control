@@ -20,6 +20,7 @@ on:
       - sdk/**
       - resources/**
       - obsbot-control.desktop
+      - obsbot-cli.desktop
 
 env:
   # Qt 6.5+ defaults QtMultimedia to the FFmpeg backend, which is far more
@@ -31,6 +32,11 @@ env:
   # pass an empty version to aqtinstall. Keep this default in step with the
   # workflow_dispatch input default above.
   QT_VERSION: ${{ inputs.qt_version || '6.8.3' }}
+  # The compatibility promise made to users, enforced by the verify step. Set
+  # to the container's own glibc rather than the lower value the bundle
+  # happens to require, so the promise cannot be broken by a dependency
+  # bumping the real floor. Changing this means changing README.md too.
+  GLIBC_FLOOR: "2.39"
 
 jobs:
   appimage:
@@ -131,10 +137,15 @@ jobs:
           # -l bundles the vendored SDK explicitly and lets linuxdeploy rewrite
           # its rpath; libGL/Mesa/libdrm are dropped by linuxdeploy's
           # excludelist so the host's drivers get used instead.
+          # Resolve the SDK soname from the symlink instead of pinning it:
+          # the vendored SDK version changes (v1.0.2 shipped libdev.so.1.0.2,
+          # v2.1.0_8 ships libdev.so.1.0.0) and a pinned name fails the build
+          # silently at the bundling step on every upgrade.
+          SDK_LIB=$(readlink -f sdk/lib/libdev.so)
           linuxdeploy \
             --appdir AppDir \
             -e bin/obsbot-gui \
-            -l sdk/lib/libdev.so.1.0.2 \
+            -l "$SDK_LIB" \
             -d obsbot-control.desktop \
             -i obsbot-control.svg \
             --plugin qt \
@@ -148,7 +159,8 @@ jobs:
           ./obsbot-control-x86_64.AppImage --appimage-extract >/dev/null
           status=0
 
-          for lib in libdev.so.1.0.2 libQt6Multimedia.so.6 libQt6OpenGLWidgets.so.6; do
+          SDK_LIB=$(basename "$(readlink -f sdk/lib/libdev.so)")
+          for lib in "$SDK_LIB" libQt6Multimedia.so.6 libQt6OpenGLWidgets.so.6; do
             if ! find squashfs-root -name "$lib" | grep -q .; then
               echo "::error::$lib missing from AppImage"
               status=1
@@ -168,13 +180,158 @@ jobs:
             status=1
           fi
 
-          echo "== glibc floor of the shipped binary =="
-          objdump -T squashfs-root/usr/bin/obsbot-gui \
-            | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -3
+          # The documented floor is the build container's glibc, not whatever
+          # today's dependency set happens to need. Those differ: the bundle
+          # currently tops out at 2.38, but promising 2.38 would stake the
+          # compatibility claim on an incidental measurement that any Qt or
+          # apt update could quietly raise. Promise 2.39 and enforce it.
+          #
+          # Every bundled ELF object counts, not just the executable. A Qt or
+          # FFmpeg library can raise the real floor without obsbot-gui itself
+          # changing, which the old single-binary objdump would have missed.
+          echo "== highest glibc symbol version required by any bundled object =="
+          worst=$(find squashfs-root -type f \( -name '*.so*' -o -path '*/bin/*' \) \
+            -exec sh -c 'for f; do
+                file -b "$f" | grep -q ELF || continue
+                objdump -T "$f" 2>/dev/null | grep -oE "GLIBC_[0-9]+\.[0-9]+(\.[0-9]+)?"
+              done' sh {} + \
+            | sed 's/GLIBC_//' | sort -uV | tail -1)
+          echo "required: ${worst:-none}   documented floor: $GLIBC_FLOOR"
+          if [ -z "$worst" ]; then
+            echo "::error::found no glibc symbol versions at all; the scan is broken"
+            status=1
+          fi
+          if [ -n "$worst" ] \
+             && [ "$(printf '%s\n%s\n' "$GLIBC_FLOOR" "$worst" | sort -V | tail -1)" != "$GLIBC_FLOOR" ]; then
+            echo "::error::bundle needs glibc $worst, above the documented floor of $GLIBC_FLOOR;" \
+                 "either lower the build container or update the documented floor in README.md"
+            status=1
+          fi
           exit $status
 
       - uses: actions/upload-artifact@v4
         with:
           name: obsbot-control-AppImage
           path: obsbot-control-x86_64.AppImage
+          if-no-files-found: error
+
+  # Separate from the GUI bundle on purpose. The CLI links only the vendored
+  # SDK, so with -DBUILD_GUI=OFF it needs no Qt at all: no aqtinstall download,
+  # no Qt plugin, and a 1.6 MB AppImage rather than the GUI bundle's 46 MB. A
+  # Stream Deck or hotkey runs this per button press, so start-up cost is the
+  # whole point.
+  cli-appimage:
+    name: CLI AppImage (x86_64)
+    runs-on: ubuntu-latest
+    # Same glibc floor as the GUI bundle, for the same reason: 24.04 = 2.39.
+    container: ubuntu:24.04
+
+    steps:
+      - name: Install build and packaging dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config git curl ca-certificates \
+            file desktop-file-utils patchelf binutils
+
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_GUI=OFF
+          cmake --build build --parallel --target obsbot-cli
+
+      - name: Prepare icon
+        run: |
+          # linuxdeploy matches the icon basename against Icon= in the .desktop
+          # file, which is "obsbot-cli" here.
+          cp resources/icons/camera.svg obsbot-cli.svg
+
+      - name: Fetch linuxdeploy
+        run: |
+          curl -fsSLo /usr/local/bin/linuxdeploy \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          chmod +x /usr/local/bin/linuxdeploy
+
+      - name: Build AppImage
+        env:
+          ARCH: x86_64
+        run: |
+          # No --plugin qt: this binary links libdev and libstdc++ only.
+          SDK_LIB=$(readlink -f sdk/lib/libdev.so)
+          linuxdeploy \
+            --appdir AppDir \
+            -e bin/obsbot-cli \
+            -l "$SDK_LIB" \
+            -d obsbot-cli.desktop \
+            -i obsbot-cli.svg \
+            --output appimage
+          mv ./*.AppImage obsbot-cli-x86_64.AppImage
+
+      - name: Verify AppImage
+        run: |
+          ./obsbot-cli-x86_64.AppImage --appimage-extract >/dev/null
+          status=0
+
+          # The SDK is the only thing that must be bundled; without it the
+          # binary cannot resolve at run time on a machine that lacks it.
+          SDK_LIB=$(basename "$(readlink -f sdk/lib/libdev.so)")
+          if ! find squashfs-root -name "$SDK_LIB" | grep -q .; then
+            echo "::error::$SDK_LIB missing from AppImage"
+            status=1
+          fi
+
+          # Qt must NOT be here. If it is, BUILD_GUI leaked back on and the
+          # small-and-fast rationale for a separate CLI image is gone.
+          if find squashfs-root -name 'libQt6*.so*' | grep -q .; then
+            echo "::error::Qt libraries were bundled into the CLI AppImage"
+            status=1
+          fi
+
+          # Argument parsing runs before any device scan, so --help exercises
+          # the real binary end to end without a camera attached.
+          if ! ./obsbot-cli-x86_64.AppImage --help | grep -q 'hdr on|off|toggle'; then
+            echo "::error::--help did not list the one-shot commands"
+            status=1
+          fi
+
+          # A bad argument must be rejected without touching hardware, and must
+          # exit 2 -- Stream Deck buttons and scripts branch on these codes.
+          # `|| rc=$?` is required, not stylistic: steps run under `bash -e`, so
+          # a bare call to a command expected to fail aborts the step before the
+          # exit code can be captured.
+          rc=0
+          ./obsbot-cli-x86_64.AppImage hdr maybe >/dev/null 2>&1 || rc=$?
+          if [ "$rc" -ne 2 ]; then
+            echo "::error::expected exit 2 for a bad argument, got $rc"
+            status=1
+          fi
+
+          # Same glibc promise as the GUI bundle, enforced over every ELF here.
+          worst=$(find squashfs-root -type f \( -name '*.so*' -o -path '*/bin/*' \) \
+            -exec sh -c 'for f; do
+                file -b "$f" | grep -q ELF || continue
+                objdump -T "$f" 2>/dev/null | grep -oE "GLIBC_[0-9]+\.[0-9]+(\.[0-9]+)?"
+              done' sh {} + \
+            | sed 's/GLIBC_//' | sort -uV | tail -1)
+          echo "required: ${worst:-none}   documented floor: $GLIBC_FLOOR"
+          if [ -z "$worst" ]; then
+            echo "::error::found no glibc symbol versions at all; the scan is broken"
+            status=1
+          fi
+          if [ -n "$worst" ] \
+             && [ "$(printf '%s\n%s\n' "$GLIBC_FLOOR" "$worst" | sort -V | tail -1)" != "$GLIBC_FLOOR" ]; then
+            echo "::error::bundle needs glibc $worst, above the documented floor of $GLIBC_FLOOR"
+            status=1
+          fi
+          exit $status
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: obsbot-cli-AppImage
+          path: obsbot-cli-x86_64.AppImage
           if-no-files-found: error

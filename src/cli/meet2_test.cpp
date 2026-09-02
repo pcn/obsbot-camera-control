@@ -3,8 +3,11 @@
 #include <chrono>
 #include <string>
 #include <cstring>
+#include <unistd.h>
+#include <vector>
 #include <dev/devs.hpp>
 #include "Config.h"
+#include "Commands.h"
 
 using namespace std;
 
@@ -13,62 +16,55 @@ bool handleConfigErrors(Config &config);
 void applyConfigToCamera(shared_ptr<Device> dev, const Config::CameraSettings &settings);
 void runInteractiveMode(shared_ptr<Device> dev);
 
-int main(int argc, char **argv)
+static const char *whiteBalanceName(int wb)
 {
-    bool interactive = false;
-
-    // Parse command line arguments
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0) {
-            interactive = true;
-        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-            cout << "OBSBOT Control - CLI Tool" << endl;
-            cout << "\nUsage: " << argv[0] << " [options]" << endl;
-            cout << "\nOptions:" << endl;
-            cout << "  -i, --interactive    Run in interactive menu mode" << endl;
-            cout << "  -h, --help           Show this help message" << endl;
-            cout << "\nDefault behavior:" << endl;
-            cout << "  Loads configuration from ~/.config/obsbot-control/settings.conf" << endl;
-            cout << "  Applies settings to camera and exits" << endl;
-            return 0;
-        }
+    switch (wb) {
+        case Device::DevWhiteBalanceAuto:        return "Auto";
+        case Device::DevWhiteBalanceDaylight:    return "Daylight";
+        case Device::DevWhiteBalanceFluorescent: return "Fluorescent";
+        case Device::DevWhiteBalanceTungsten:    return "Tungsten";
+        case Device::DevWhiteBalanceFlash:       return "Flash";
+        case Device::DevWhiteBalanceFine:        return "Fine";
+        case Device::DevWhiteBalanceCloudy:      return "Cloudy";
+        case Device::DevWhiteBalanceShade:       return "Shade";
+        default:                                 return "Manual";
     }
+}
 
-    cout << "OBSBOT Control" << (interactive ? " - Interactive Mode" : "") << endl;
+/// Uses a fixed program name rather than argv[0]: inside an AppImage argv[0]
+/// is the extracted AppRun under /tmp, which is not a path anyone can retype.
+static void printHelp()
+{
+    cout << "OBSBOT Control - CLI Tool\n"
+         << "\nUsage: obsbot-cli [<command> [args]]\n"
+         << "       obsbot-cli [options]\n"
+         << "\nOptions:\n"
+         << "  -i, --interactive    Run in interactive menu mode\n"
+         << "  -h, --help           Show this help message\n"
+         << "\nWith no command, settings are read from\n"
+         << "  ~/.config/obsbot-control/settings.conf\n"
+         << "and applied to the camera (same as the 'apply' command).\n\n";
+    cli::printUsage();
+}
 
-    // Load configuration
-    Config config;
-    vector<Config::ValidationError> errors;
-    if (!config.load(errors)) {
-        // Config has validation errors
-        if (!handleConfigErrors(config)) {
-            cout << "Continuing without saving settings." << endl;
-        }
-    } else {
-        if (!config.configExists()) {
-            cout << "No config file found. Using defaults." << endl;
-        } else {
-            cout << "Configuration loaded from: " << config.getConfigPath() << endl;
-        }
-    }
-
-    // Device detection callback
+/// Wait for the SDK's USB enumeration to produce a device. Returns nullptr and
+/// prints if none appeared; @p quiet suppresses the progress chatter so a
+/// one-shot command's stdout carries only its own result.
+static shared_ptr<Device> findDevice(bool quiet)
+{
     bool device_connected = false;
-    auto onDevChanged = [&device_connected](std::string dev_sn, bool connected, void *param) {
-        if (connected) {
-            cout << "Device " << dev_sn << " connected" << endl;
-            device_connected = true;
-        } else {
-            cout << "Device " << dev_sn << " disconnected" << endl;
+    auto onDevChanged = [&device_connected, quiet](std::string dev_sn, bool connected, void *param) {
+        if (!quiet) {
+            cout << "Device " << dev_sn << (connected ? " connected" : " disconnected") << endl;
         }
+        if (connected) device_connected = true;
     };
 
-    // Register device detection
     Devices::get().setDevChangedCallback(onDevChanged, nullptr);
     Devices::get().setEnableMdnsScan(false);  // USB only
 
-    // Wait for device detection with timeout
-    cout << "Waiting for OBSBOT camera..." << endl;
+    if (!quiet) cout << "Waiting for OBSBOT camera..." << endl;
+
     const int timeout_seconds = 10;
     for (int i = 0; i < timeout_seconds * 10; i++) {
         if (device_connected) {
@@ -81,37 +77,141 @@ int main(int argc, char **argv)
 
     auto dev_list = Devices::get().getDevList();
     if (dev_list.empty()) {
-        cout << "No OBSBOT devices found!" << endl;
-        return 1;
+        cerr << "obsbot-cli: no OBSBOT devices found" << endl;
+        return nullptr;
+    }
+    return dev_list.front();
+}
+
+int main(int argc, char **argv)
+{
+    bool interactive = false;
+    string command;
+    vector<string> command_args;
+
+    // A command must be argv[1]. Recognising it before anything else keeps a
+    // typo cheap: it fails immediately rather than after the 10s device scan.
+    if (argc > 1 && (cli::isCommand(argv[1]) || strcmp(argv[1], "apply") == 0)) {
+        command = argv[1];
+        for (int i = 2; i < argc; i++) command_args.push_back(argv[i]);
+    } else {
+        for (int i = 1; i < argc; i++) {
+            if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0) {
+                interactive = true;
+            } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+                printHelp();
+                return cli::ExitOk;
+            } else {
+                cerr << "obsbot-cli: unknown option '" << argv[i]
+                     << "'; run --help for usage" << endl;
+                return cli::ExitUsage;
+            }
+        }
     }
 
-    // Get first device
-    auto dev = dev_list.front();
-    cout << "\nFound device:" << endl;
-    cout << "  Name: " << dev->devName() << endl;
-    cout << "  SN: " << dev->devSn() << endl;
-    cout << "  Version: " << dev->devVersion() << endl;
-    cout << "  Product Type: " << dev->productType() << endl;
+    // A one-shot command is what a hotkey or Stream Deck button runs, with no
+    // terminal attached to answer prompts, so its output stays terse and the
+    // config-error path below must never stop to ask a question.
+    const bool one_shot = !command.empty();
 
-    // Note: This app was primarily tested with Meet 2, but may work with other models
-    if (dev->productType() != ObsbotProdMeet2) {
-        cout << "\nNote: This camera is not a Meet 2." << endl;
-        cout << "      Some features may not work as expected." << endl;
+    // The SDK logs unconditionally to stdout, which would interleave with and
+    // corrupt `status`'s key=value output. Move the real stdout aside and point
+    // fd 1 at stderr, so SDK chatter becomes diagnostics and only the command's
+    // own output (buffered by cli::out) reaches the caller's stdout. Left alone
+    // in interactive mode, where the menu is meant to be read by a human.
+    int saved_stdout = STDOUT_FILENO;
+    if (one_shot) {
+        saved_stdout = dup(STDOUT_FILENO);
+        if (saved_stdout >= 0) {
+            dup2(STDERR_FILENO, STDOUT_FILENO);
+        } else {
+            saved_stdout = STDOUT_FILENO;  // no redirect; SDK noise is the lesser evil
+        }
+    }
+
+    if (!one_shot) {
+        cout << "OBSBOT Control" << (interactive ? " - Interactive Mode" : "") << endl;
+    }
+
+    // Load configuration
+    Config config;
+    vector<Config::ValidationError> errors;
+    if (!config.load(errors)) {
+        if (one_shot) {
+            // Report and carry on with defaults: a broken config file should
+            // not stop 'hdr on' from reaching the camera, and it must not
+            // then be overwritten by those defaults.
+            cerr << "obsbot-cli: warning: " << config.getConfigPath()
+                 << " has errors; using defaults and not saving" << endl;
+            for (const auto &err : errors) {
+                cerr << "  " << (err.lineNumber > 0 ? "line " + to_string(err.lineNumber) + ": " : "")
+                     << err.message << endl;
+            }
+            config.disableSaving();
+        } else if (!handleConfigErrors(config)) {
+            cout << "Continuing without saving settings." << endl;
+        }
+    } else if (!one_shot) {
+        if (!config.configExists()) {
+            cout << "No config file found. Using defaults." << endl;
+        } else {
+            cout << "Configuration loaded from: " << config.getConfigPath() << endl;
+        }
+    }
+
+    // Scanned lazily and at most once: a command validates its arguments
+    // first and only then asks for the camera, so a typo costs nothing rather
+    // than the full detection timeout.
+    shared_ptr<Device> dev;
+    bool scanned = false;
+    auto device = [&]() -> shared_ptr<Device> {
+        if (!scanned) {
+            scanned = true;
+            dev = findDevice(one_shot);
+        }
+        return dev;
+    };
+
+    if (one_shot && command != "apply") {
+        int rc = cli::run(device, config, command, command_args);
+        cli::writeOutput(saved_stdout);
+        return rc;
+    }
+
+    if (!device()) return cli::ExitNoDevice;
+
+    if (!one_shot) {
+        cout << "\nFound device:" << endl;
+        cout << "  Name: " << dev->devName() << endl;
+        cout << "  SN: " << dev->devSn() << endl;
+        cout << "  Version: " << dev->devVersion() << endl;
+        cout << "  Product Type: " << dev->productType() << endl;
+
+        // Note: This app was primarily tested with Meet 2, but may work with other models
+        if (dev->productType() != ObsbotProdMeet2) {
+            cout << "\nNote: This camera is not a Meet 2." << endl;
+            cout << "      Some features may not work as expected." << endl;
+        }
     }
 
     if (interactive) {
-        // Interactive mode - run menu
         runInteractiveMode(dev);
-    } else {
-        // Non-interactive mode - apply config and exit
-        cout << "\nApplying configuration to camera..." << endl;
-        auto settings = config.getSettings();
-        applyConfigToCamera(dev, settings);
+        return cli::ExitOk;
+    }
+
+    // 'apply', and the no-argument default: push the whole config file.
+    if (!command_args.empty()) {
+        cerr << "obsbot-cli: apply takes no arguments" << endl;
+        return cli::ExitUsage;
+    }
+    if (!one_shot) cout << "\nApplying configuration to camera..." << endl;
+    applyConfigToCamera(dev, config.getSettings());
+    if (!one_shot) {
         cout << "Configuration applied successfully." << endl;
         cout << "Camera settings have been updated." << endl;
     }
-
-    return 0;
+    cli::writeOutput(saved_stdout);
+    return cli::ExitOk;
 }
 
 bool handleConfigErrors(Config &config)
@@ -256,10 +356,28 @@ void applyConfigToCamera(shared_ptr<Device> dev, const Config::CameraSettings &s
         cout << "    Failed (code: " << ret << ")" << endl;
     }
 
-    const char* wbNames[] = {"Auto", "Daylight", "Fluorescent", "Tungsten", "Flash", "Fine", "Cloudy", "Shade"};
-    cout << "  Setting White Balance: " << wbNames[settings.whiteBalance] << endl;
+    // Config stores the SDK's DevWhiteBalanceType values, which are not
+    // contiguous -- Fine is 9, Cloudy 10, Shade 11, manual Kelvin 255 -- so
+    // this has to be a lookup, not an index into a dense array.
+    //
+    // The second argument is the manual colour temperature and is documented
+    // "only valid when wb_type is manual". Passing a hardcoded 0 here used to
+    // drop white_balance_kelvin entirely: the camera clamped 0 up to its 2000K
+    // minimum, which tells it the light is very warm, so it compensated with a
+    // heavy blue cast. The config value was parsed and range-checked and then
+    // never sent.
     Device::DevWhiteBalanceType wbType = static_cast<Device::DevWhiteBalanceType>(settings.whiteBalance);
-    ret = dev->cameraSetWhiteBalanceR(wbType, 0);
+    const bool manual = wbType == Device::DevWhiteBalanceManual;
+    int32_t wbParam = 0;
+    if (manual) {
+        // -1 is Config's "unset". Falling back to the driver default beats
+        // sending 0, which is not a temperature at all.
+        wbParam = settings.whiteBalanceKelvin > 0 ? settings.whiteBalanceKelvin : 5000;
+    }
+    cout << "  Setting White Balance: " << whiteBalanceName(settings.whiteBalance);
+    if (manual) cout << " (" << wbParam << "K)";
+    cout << endl;
+    ret = dev->cameraSetWhiteBalanceR(wbType, wbParam);
     if (ret != 0) {
         cout << "    Failed (code: " << ret << ")" << endl;
     }

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=OBSBOT Control CLI
+GenericName=Camera Control
+Comment=Control OBSBOT camera settings from scripts and hotkeys
+Exec=obsbot-cli
+Icon=obsbot-cli
+Terminal=true
+Categories=Utility;
+Keywords=camera;obsbot;webcam;video;ptz;streaming;cli;
+NoDisplay=true

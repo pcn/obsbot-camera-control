@@ -50,10 +50,14 @@ package() {
     install -Dm755 bin/obsbot-gui "${pkgdir}/usr/bin/obsbot-gui"
     install -Dm755 bin/obsbot-cli "${pkgdir}/usr/bin/obsbot-cli"
 
-    # Install SDK library
-    install -Dm755 sdk/lib/libdev.so.1.0.2 "${pkgdir}/usr/lib/libdev.so.1.0.2"
-    ln -s libdev.so.1.0.2 "${pkgdir}/usr/lib/libdev.so.1"
-    ln -s libdev.so.1.0.2 "${pkgdir}/usr/lib/libdev.so"
+    # Install SDK library. The soname is derived rather than pinned: the
+    # vendored SDK version changes (v1.0.2 shipped libdev.so.1.0.2, v2.1.0_8
+    # ships libdev.so.1.0.0) and a pinned name breaks packaging on upgrade.
+    local _sdk_lib
+    _sdk_lib=$(basename "$(readlink -f sdk/lib/libdev.so)")
+    install -Dm755 "sdk/lib/${_sdk_lib}" "${pkgdir}/usr/lib/${_sdk_lib}"
+    ln -s "${_sdk_lib}" "${pkgdir}/usr/lib/libdev.so.1"
+    ln -s "${_sdk_lib}" "${pkgdir}/usr/lib/libdev.so"
 
     # Install desktop file
     install -Dm644 obsbot-control.desktop \
