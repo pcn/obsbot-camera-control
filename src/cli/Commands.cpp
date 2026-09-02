@@ -1105,22 +1105,25 @@ const GroupInfo kGroups[] = {
 
 const Command kCommands[] = {
     // Framing and optics: these change where the camera looks or how the lens
-    // gathers light. `ai` and `tracking` live here rather than under image
-    // tuning because both physically re-aim the gimbal.
-    {"ai",         "<mode>|toggle <mode>",          "none group single hand whiteboard desk", cmdAi,        GroupView},
+    // gathers light, under direct instruction. The AI-driven equivalents that
+    // decide for themselves where to look are grouped as AI instead.
     {"focus",      "auto|<0-100>|in|out [step]",    "focus",                                cmdFocus,       GroupView},
     {"fov",        "wide|medium|narrow|cycle",      "field of view (86/78/65 degrees)",     cmdFov,         GroupView},
     {"orient",     "<pan-deg> <tilt-deg>",          "absolute gimbal angle in degrees",     cmdOrient,      GroupView},
     {"pan-tilt",   "<pan> <tilt>|center|<dir>",     "gimbal; dir = left right up down",     cmdPanTilt,     GroupView},
     {"recenter",   "",                              "re-home the gimbal (SDK; recovery)",   cmdRecenter,    GroupView},
-    {"tracking",   "on|off",                        "auto-framing (media mode)",            cmdTracking,    GroupView},
     {"zoom",       "<1.0-2.0>|<n>%|in|out|reset",   "zoom; 1.0-2.0 spans the full range",   cmdZoom,        GroupView},
 
-    // Image tuning: applied to the captured image rather than to the optics.
+    // AI and colour. Note this group is not purely image processing: `ai` and
+    // `tracking` move the gimbal as a side effect of what the AI decides to
+    // follow, so they sit here with the other AI features rather than with the
+    // commands that aim the camera on explicit instruction.
+    {"ai",         "<mode>|toggle <mode>",          "none group single hand whiteboard desk", cmdAi,        GroupImage},
     {"face-ae",    "on|off|toggle",                 "face auto-exposure",                   cmdFaceAe,      GroupImage},
     {"face-focus", "on|off|toggle",                 "face auto-focus",                      cmdFaceFocus,   GroupImage},
     {"gesture",    "on|off|toggle [target|zoom|all]","hand-gesture triggers (default target)",cmdGesture,    GroupImage},
     {"hdr",        "on|off|toggle",                 "HDR (wide dynamic range)",             cmdHdr,         GroupImage},
+    {"tracking",   "on|off",                        "auto-framing (media mode)",            cmdTracking,    GroupImage},
     {"whitebal",   "auto|<kelvin>",                 "room light colour temp (2000-10000K)", cmdWhiteBalance,GroupImage},
 
     // Neither of the above.
